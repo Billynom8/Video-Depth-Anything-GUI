@@ -1,7 +1,9 @@
 .vscode/
+checkpoints/
 outputs
 checkpoints
 __pycache__
 */__pycache__
 *.pyc
 gradio*
+config_vda.json
