@@ -11,8 +11,19 @@ import cv2  # Added for PNG saving
 from video_depth_anything.video_depth import VideoDepthAnything
 from utils.dc_utils import read_video_frames, save_video
 from typing import Tuple, Any, cast
-
+import subprocess
 from queue import Queue, Empty  # Used for thread-safe communication and its exception
+
+# Import the new helper function for H.26x encoding
+try:
+    from utils.h26x_utils import run_h26x_encoding
+except ImportError:
+    # If not run as a package or h26x_utils is not available, import directly
+    try:
+        from h26x_utils import run_h26x_encoding
+    except ImportError:
+        def run_h26x_encoding(*args, **kwargs):
+            raise RuntimeError("h26x_utils.py or its dependencies (FFmpeg) not found.")
 
 # Define model configurations (kept from original)
 model_configs = {
@@ -115,6 +126,7 @@ class VideoDepthAnythingGUI(tk.Tk):
             '-MP4_CRF-': self.mp4_crf_var.get(),
             '-METRIC-': self.metric_var.get(),
             '-INVERT_METRIC-': self.invert_metric_var.get(),
+            '-VIDEO_OUTPUT_MODE-': self.video_output_mode_var.get(),
         }
         with open(self.settings_file, 'w') as f:
             json.dump(current_values, f, indent=4)
@@ -132,6 +144,7 @@ class VideoDepthAnythingGUI(tk.Tk):
         
         self.png_compression_var = tk.IntVar(value=self.saved_values.get('-PNG_COMPRESSION-', 1))
         self.mp4_crf_var = tk.IntVar(value=self.saved_values.get('-MP4_CRF-', 18))
+        self.video_output_mode_var = tk.StringVar(value=self.saved_values.get('-VIDEO_OUTPUT_MODE-', 'original_save (faster)'))
         
         self.fp32_var = tk.BooleanVar(value=self.saved_values.get('-FP32-', False))
         self.save_color_var = tk.BooleanVar(value=self.saved_values.get('-SAVE_COLOR-', False))
@@ -301,18 +314,40 @@ class VideoDepthAnythingGUI(tk.Tk):
         slider_png_comp = ttk.Scale(self, from_=0, to=9, orient=tk.HORIZONTAL, variable=self.png_compression_var, length=150)
         slider_png_comp.grid(row=r, column=1, padx=5, pady=5, sticky='ew')
         
-        # MP4 CRF
-        lbl_mp4_crf = ttk.Label(self, text='MP4 CRF')
-        lbl_mp4_crf.grid(row=r+1, column=0, padx=10, pady=5, sticky='w')
-        ToolTip(lbl_mp4_crf, "(0=lossless; higher numbers lower quality\nDefault=18)")
-        
-        slider_mp4_crf = ttk.Scale(self, from_=0, to=51, orient=tk.HORIZONTAL, variable=self.mp4_crf_var, length=150)
-        slider_mp4_crf.grid(row=r+1, column=1, padx=5, pady=5, sticky='ew')
-        
-        # Current slider values (Optional: display current value next to slider)
+        # MP4 CRF Label (repurposed for display)
         ttk.Label(self, textvariable=self.png_compression_var).grid(row=r, column=2, padx=5, pady=5, sticky='w')
-        ttk.Label(self, textvariable=self.mp4_crf_var).grid(row=r+1, column=2, padx=5, pady=5, sticky='w')
-        r += 2
+        r += 1 # Increment from PNG compression row
+
+        # New Video Output Mode Combobox
+        lbl_video_mode = ttk.Label(self, text='Video Output Mode')
+        lbl_video_mode.grid(row=r, column=0, padx=10, pady=5, sticky='w')
+        ToolTip(lbl_video_mode, "Select the video encoding path. CRF is controlled by the MP4 CRF setting.")
+
+        video_modes = [
+            'original_save (faster)',
+            'libx264 (8-bit)',
+            'libx265 (10-bit)',
+            'nvenc_h264 (8-bit)',
+            'nvenc_h265 (10-bit)',
+            'None (Do not save video)',
+        ]
+        combo_video_mode = ttk.Combobox(self, textvariable=self.video_output_mode_var, values=video_modes, state='readonly')
+        combo_video_mode.grid(row=r, column=1, padx=5, pady=5, sticky='ew')
+        
+        # Reuse the MP4 CRF value display here and add back the CRF scale
+        frame_crf = ttk.Frame(self)
+        frame_crf.grid(row=r, column=2, padx=10, pady=5, sticky='w')
+        
+        lbl_crf_label = ttk.Label(frame_crf, text='CRF:')
+        lbl_crf_label.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # We must change the variable type. Since self.mp4_crf_var is an IntVar, we
+        # use an Entry that is linked to it. Tkinter can handle this binding.
+        entry_mp4_crf = ttk.Entry(frame_crf, textvariable=self.mp4_crf_var, width=5)
+        entry_mp4_crf.pack(side=tk.LEFT)
+        ToolTip(entry_mp4_crf, "(0=lossless; higher numbers lower quality\nDefault=18)")
+
+        r += 1 # Increment for the video mode row
 
         # Resume Checkbox
         check_resume = ttk.Checkbutton(self, text='Resume', variable=self.resume_var)
@@ -423,6 +458,9 @@ class VideoDepthAnythingGUI(tk.Tk):
             '-INVERT_METRIC-': self.invert_metric_var.get(),
             '-MP4_CRF-': self.mp4_crf_var.get(),
             '-INVERT_METRIC-': self.invert_metric_var.get(),
+            '-MP4_CRF-': self.mp4_crf_var.get(),
+            '-INVERT_METRIC-': self.invert_metric_var.get(),
+            '-VIDEO_OUTPUT_MODE-': self.video_output_mode_var.get(),
         }
 
         self.processing_thread = threading.Thread(
@@ -530,6 +568,7 @@ class VideoDepthAnythingGUI(tk.Tk):
         mp4_crf = int(values['-MP4_CRF-'])
         metric = values['-METRIC-']
         invert_metric = values['-INVERT_METRIC-']
+        video_output_mode = values['-VIDEO_OUTPUT_MODE-']
 
         # Determine files to process
         if input_file:
@@ -549,6 +588,11 @@ class VideoDepthAnythingGUI(tk.Tk):
             write_event_value('-ERROR-', 'Logic Error: No input selected.')
             return
 
+        # NEW CHECK: Ensure at least one output is selected
+        if video_output_mode == 'None (Do not save video)' and not any([save_npz, save_exr, save_png]):
+             write_event_value('-ERROR-', 'Please select at least one output format (Video, NPZ, EXR, or PNG).')
+             return
+        
         # Initialize device and model
         DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
         write_event_value('-STATUS_UPDATE-', 'Loading model...')
@@ -626,20 +670,76 @@ class VideoDepthAnythingGUI(tk.Tk):
             try:
                 processed_video_path = os.path.join(output_dir, base_name_no_ext + '_src.mp4')
                 depth_vis_path = os.path.join(output_dir, base_name_no_ext + '_depth.mp4')
+                depth_png_dir = os.path.join(output_dir, base_name_no_ext + '_depth_png') # Define intermediate folder early
+
+                # --- 1. Process for Visualization/Source (and potential H.26x input) ---
                 
-                if create_src:
-                    save_video(frames, processed_video_path, fps=fps, crf=mp4_crf)
-                
-                # Create a copy for visualization. The raw depths should not be modified.
+                # Copy for visualization (needed for both original_save and for potential inversion)
                 depths_vis = depths.copy()
-                
-                # Apply inversion for visualization only if the user checked the 'Invert' box
                 if invert_metric:
-                    # Invert the depth values (max - current) to flip the visualization
-                    # Note: We only do this for the *visualization*, not for npz/exr/png raw data.
                     depths_vis = depths_vis.max() - depths_vis
                 
-                save_video(depths_vis, depth_vis_path, fps=fps, is_depths=True, grayscale=grayscale, crf=mp4_crf)
+                # Check if we are using the H.26x pipeline (which requires PNGs)
+                is_h26x_mode = video_output_mode not in ['None (Do not save video)', 'original_save (faster)']
+                
+                # --- 2. Create Source Clip (Always uses original save_video) ---
+                if create_src:
+                    save_video(frames, processed_video_path, fps=fps, crf=mp4_crf)
+                    
+                # --- 3. Depth Video Saving ---
+                if video_output_mode == 'original_save (faster)':
+                    # Original fast path: use save_video directly (8-bit MP4)
+                    save_video(depths_vis, depth_vis_path, fps=fps, is_depths=True, grayscale=grayscale, crf=mp4_crf)
+                
+                elif is_h26x_mode or save_png:
+                    # H.26x path OR standalone PNG save selected: save PNGs first
+                    
+                    # Force 16-bit PNG if using H.26x mode for 10-bit input quality
+                    is_16bit_png = png_16bit or is_h26x_mode 
+                    
+                    os.makedirs(depth_png_dir, exist_ok=True)
+                    d_min = depths.min()
+                    d_max = depths.max()
+                    
+                    for j, depth in enumerate(depths):
+                        if is_16bit_png:
+                            depth_norm = (depth - d_min) / (d_max - d_min) * 65535
+                            depth_img = depth_norm.astype(np.uint16)
+                        else:
+                            depth_norm = (depth - d_min) / (d_max - d_min) * 255
+                            depth_img = depth_norm.astype(np.uint8)
+                        
+                        # Apply VISUAL inversion to PNG if requested, but only if it's 8-bit, 
+                        # otherwise 16-bit raw data for H.26x should be untouched.
+                        # Since we force 16-bit for H.26x, the 16-bit data remains raw metric.
+                        # The H.26x encoder will handle the inversion if needed.
+                        if invert_metric and not is_h26x_mode:
+                             # Apply inversion to the 8-bit data only if not using H.26x
+                             depth_img = np.max(depth_img) - depth_img 
+                             
+                        output_png = f"{depth_png_dir}/frame_{j:05d}.png"
+                        compression_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
+                        cv2.imwrite(output_png, depth_img, compression_params)
+
+                    # --- 4. H.26x Encoding (Executed only if is_h26x_mode) ---
+                    if is_h26x_mode:
+                        write_event_value('-STATUS_UPDATE-', f'Encoding H.26x video for {base_name_no_ext}...')
+                        
+                        # New FFmpeg utility function call
+                        run_h26x_encoding(
+                            input_dir=depth_png_dir, 
+                            output_path=depth_vis_path, 
+                            codec_mode=video_output_mode, 
+                            fps=fps, 
+                            crf=mp4_crf,
+                            invert_vis=invert_metric, # Pass inversion flag for FFmpeg logic
+                            write_event_value=write_event_value
+                        )
+
+                    # --- 5. H.26x Cleanup (Conditional on save_png == False) ---
+                    if is_h26x_mode and not save_png:
+                        write_event_value('-STATUS_UPDATE-', f'Deleting intermediate PNGs for {base_name_no_ext}...')
+                        shutil.rmtree(depth_png_dir)
 
                 if save_npz:
                     depth_npz_path = os.path.join(output_dir, base_name_no_ext + '_depths.npz')
