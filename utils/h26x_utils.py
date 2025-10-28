@@ -18,14 +18,14 @@ def run_h26x_encoding(input_dir, output_path, codec_mode, fps, crf, invert_vis, 
     
     # 1. Determine Codec, Profile, and Pixel Format based on mode
     codec_map = {
-        'libx264 (8-bit)': ('libx264', 'high', 'yuv420p', False),
-        'libx265 (10-bit)': ('libx265', 'main10', 'yuv420p10le', True),
-        'nvenc_h264 (8-bit)': ('h264_nvenc', 'high', 'yuv420p', False),
-        'nvenc_h265 (10-bit)': ('hevc_nvenc', 'main10', 'yuv420p10le', True),
+        'libx264 (8-bit)': ('libx264', 'high', 'yuv420p', False, '-crf'),
+        'libx265 (10-bit)': ('libx265', 'main10', 'yuv420p10le', True, '-crf'),
+        'nvenc_h264 (8-bit)': ('h264_nvenc', 'high', 'yuv420p', False, '-qp'),
+        'nvenc_h265 (10-bit)': ('hevc_nvenc', 'main10', 'yuv420p10le', True, '-qp'),
     }
 
     try:
-        codec, profile, pix_fmt, is_10bit = codec_map[codec_mode]
+        codec, profile, pix_fmt, is_10bit, rate_param = codec_map[codec_mode]
     except KeyError:
         write_event_value('-ERROR-', f"Internal error: Unknown codec mode '{codec_mode}'")
         return
@@ -59,7 +59,7 @@ def run_h26x_encoding(input_dir, output_path, codec_mode, fps, crf, invert_vis, 
     output_args = [
         '-vcodec', codec,
         '-pix_fmt', pix_fmt,
-        '-crf', str(crf),
+        rate_param, str(crf),
         '-profile:v', profile,
         '-tag:v', 'hvc1' if is_10bit else 'avc1', # Tag for better compatibility (HEVC/AVC)
         output_path
