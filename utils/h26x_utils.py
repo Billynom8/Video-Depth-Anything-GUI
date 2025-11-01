@@ -42,18 +42,13 @@ def run_h26x_encoding(input_dir, output_path, codec_mode, fps, crf, invert_vis, 
     # V-filter for inverting visualization (Only apply if invert_vis is True)
     # The depth map is 16-bit grayscale (0-65535). Applying the curve/LUT to this.
     filter_args = []
+
+    filter_chain = 'format=gray'
     if invert_vis:
-        # Curve 'opposit' flips the tone curve (closer=lighter -> closer=darker)
-        # This is a robust way to invert visualization for 16-bit data
-        # Scale to 8-bit first for visualization purposes (FFmpeg LUTs usually expect 8-bit range)
-        filter_args.extend([
-            '-vf', f'format=gray, lut=curve=opposit',
-        ])
-    else:
-        # Convert 16-bit gray input to 8-bit gray for visualization without inversion
-        filter_args.extend([
-            '-vf', 'format=gray'
-        ])
+        # Negate inverts Luma/RGB components (which is what we want for depth viz)
+        filter_chain += ', negate'
+
+    filter_args.extend(['-vf', 'format=gray'])
         
     # Standard output arguments
     output_args = [
